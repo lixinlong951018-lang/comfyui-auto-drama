@@ -1071,7 +1071,7 @@ def extract_last_frame(video_path):
     out_png = os.path.join(tmpdir, "last.png")
     shutil.copy(video_path, tmp_video)
     r = subprocess.run(
-        ["ffmpeg", "-y", "-sseof", "-0.1", "-i", tmp_video, "-frames:v", "1", out_png],
+        ["ffmpeg", "-y", "-sseof", "-1", "-i", tmp_video, "-vf", "reverse", "-frames:v", "1", out_png],
         capture_output=True,
     )
     if r.returncode != 0 or not os.path.exists(out_png):
