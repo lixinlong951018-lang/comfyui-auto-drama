@@ -289,3 +289,26 @@ cd console && python start_daemons.py   :: 后台常驻（已做 Windows 兼容�
 如果这个项目帮到了你，欢迎扫码请作者喝杯咖啡（自愿，感谢支持）：
 
 ![微信打赏码](docs/donate.jpg)
+
+
+## 2026-10 H3 工作流适配层
+
+当前 fork 已开始把 H3 生成层从“业务代码写死节点 ID”改为语义适配：
+
+```text
+剧本 / 资产 / SQLite / daemon
+        ↓
+h3_workflow_adapter.py
+        ↓
+T2VA / I2VA / FL2VA / Ref2VA
+        ↓
+可替换的 ComfyUI API workflow
+```
+
+推荐把本机验证稳定的 ComfyUI 工作流导出为 API JSON，并在 `config.json -> h3.workflows` 指定。控制台只负责注入 prompt、首帧、真实尾帧、参考图、seed、时长等；具体 H3 节点和节点 ID 留在 workflow 层。
+
+当前 FL2VA/I2VA 默认链路：pruned INT8 ConvRot + SageAttn3（`allow_compile=false`）+ AV shift 12/3 + `res_multistep` + `simple` + 8 steps + INT8 ConvRot Video VAE。提交前会移除 Turbo LoRA、MiniMax H3 MemEff Sage 和 EasyCache。Ref2VA 暂保守使用 base 20 steps。
+
+**没有真实尾帧就按 I2VA 处理，不再制造占位尾帧。** 链式模式可把本镜分镜关键帧作为真实尾帧：有则 FL2VA，无则 I2VA。
+
+视觉质检同步改为 fail-closed：视觉服务不可用或返回无法解析时状态为 `unknown`，不再自动当作 PASS。
