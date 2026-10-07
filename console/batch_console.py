@@ -1095,27 +1095,22 @@ def submit_tasks(server, tasks, auto_download=True, chain_mode=False, role_image
     # R2V 模型预检：ref2va 权重缺失时回退 fl2va_pruned 并提示
     r2v_cfg = (_CONFIG.get("models") or {}).get("r2v") or {}
     want_unet = r2v_cfg.get("unet") or "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
-    want_clip = r2v_cfg.get("clip") or "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors"
+    want_clip = r2v_cfg.get("clip") or "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
     if any(h3a.resolve_mode(t) == "ref2va" and not (
         bool(t.get("chain_waiting")) or (bool(chain_mode) and i > 0)
     ) for i, t in enumerate(tasks)):
         unets, clips = _server_models(server)
-        use_unet, use_clip = want_unet, want_clip
-        if unets:
-            if want_unet not in unets:
-                use_unet = "minimax_h3_fl2va_pruned_int8_convrot.safetensors" if "minimax_h3_fl2va_pruned_int8_convrot.safetensors" in unets else unets[0]
-                warnings.append(
-                    f"⚠️ 服务器模型列表里没有 {want_unet}，R2V 暂回退 {use_unet}（身份锁定弱）。"
-                    "文件放对位置后重启 ComfyUI 即可生效。"
-                )
-        if clips:
-            if want_clip not in clips:
-                use_clip = clips[0]
-                warnings.append(f"⚠️ 缺少 CLIP {want_clip}，R2V 暂用 {use_clip}。")
+        if unets and want_unet not in unets:
+            return None, (
+                f"Ref2VA 需要 {want_unet}，但服务器未发现该权重。"
+                "已阻断提交，避免把 FL2VA 权重错误接到 Ref2VA conditioning。"
+            ), warnings
+        if clips and want_clip not in clips:
+            return None, f"Ref2VA 需要文本编码器 {want_clip}，服务器未发现。", warnings
         for t in tasks:
             if h3a.resolve_mode(t) == "ref2va":
-                t["r2v_unet"] = use_unet
-                t["r2v_clip"] = use_clip
+                t["r2v_unet"] = want_unet
+                t["r2v_clip"] = want_clip
     graphs, err = build_graphs(tasks)
     if err:
         return None, err, warnings
