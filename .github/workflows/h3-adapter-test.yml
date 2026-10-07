@@ -1,0 +1,21 @@
+name: H3 adapter tests
+
+on:
+  push:
+    branches:
+      - h3-workflow-adapter
+      - main
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax check
+        run: python -m py_compile workflows/h3_workflow_adapter.py console/batch_console.py
+      - name: Adapter unit tests
+        run: python workflows/test_h3_workflow_adapter.py
