@@ -63,6 +63,8 @@ def kill_existing(name):
 
 
 def main():
+    if platform.system() == "Windows":
+        raise SystemExit(subprocess.call([PY, "-B", os.path.join(BASE, "windows_control.py"), "start", "--no-browser"]))
     kill_existing("batch_console")
     kill_existing("chain_daemon")
     web = spawn("batch_console", ["batch_console.py", "8890"])

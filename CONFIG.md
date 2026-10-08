@@ -103,3 +103,58 @@
 | `COMFYUI_SERVER` | `comfyui.server` |
 | `LLM_CLOUD_API_KEY` | `llm.cloud.api_key` |
 | `IMAGE_CLOUD_API_KEY` | `image_gen.cloud.api_key` |
+
+
+---
+
+## h3（本地 H3 工作流适配层）
+
+这一层把生产调度与具体 ComfyUI 节点 ID 解耦。控制台只理解四种逻辑模式：
+
+- `t2va`：纯文本；
+- `i2va`：真实首帧；
+- `fl2va`：真实首帧 + 真实尾帧；
+- `ref2va`：多参考图。
+
+### h3.workflows
+
+可直接配置从 ComfyUI 导出的 **API/prompt JSON**：
+
+```json
+{
+  "h3": {
+    "workflows": {
+      "t2va": "",
+      "i2va": "workflows/custom/h3_i2va_api.json",
+      "fl2va": "workflows/custom/h3_fl2va_api.json",
+      "ref2va": "workflows/custom/h3_ref2va_api.json"
+    }
+  }
+}
+```
+
+留空时继续复用仓库旧模板，但所有图都会经过 `workflows/h3_workflow_adapter.py` 统一规范化。正式生产建议把本机已经验证稳定的 H3 工作流导出 API JSON 后填写在这里，不再让业务代码依赖固定节点 ID。
+
+### 当前 FL2VA / I2VA 稳定基线
+
+默认 profile 已按 RTX 5070 Ti 16GB 当前稳定链路设置：
+
+- `minimax_h3_fl2va_pruned_int8_convrot.safetensors`
+- Turbo LoRA：关闭
+- `MiniMaxH3MemoryEfficientSageAttentionPatch`：不使用
+- `PathchSageAttentionKJ`：`sageattn3`
+- `allow_compile=false`
+- `MiniMaxH3SigmaShift`：video `12` / audio `3`
+- sampler：`res_multistep`
+- scheduler：`simple`
+- FL2VA / I2VA：默认 `8` steps
+- Video VAE：`minimax_h3_video_vae_int8_convrot.safetensors`
+- Audio VAE：`minimax_h3_audio_vae_fp32.safetensors`
+
+Ref2VA 还没有按同样的 8-step/no-LoRA 条件完成质量验证，因此默认保守使用 base 20 steps。
+
+### 尾帧规则
+
+`last_frame` 为空就是 I2VA；adapter 会彻底移除 `last_frame` 输入。只有存在真实尾帧文件时才进入 FL2VA，**禁止创建占位尾帧**。
+
+链式模式下，上一镜末帧自动成为下一镜首帧；若下一镜已有分镜关键帧并启用“作为真实尾帧”，则走 FL2VA，否则自然走 I2VA。

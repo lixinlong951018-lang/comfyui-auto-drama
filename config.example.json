@@ -5,7 +5,10 @@
   },
   "storage": {
     "output_dir": "comfyui_backup/outputs",
-    "asset_dirs": ["素材", "出镜素材"]
+    "asset_dirs": [
+      "素材",
+      "出镜素材"
+    ]
   },
   "llm": {
     "provider": "local",
@@ -49,5 +52,57 @@
   "console": {
     "port": 8890,
     "max_ref_images": 8
+  },
+  "h3": {
+    "workflows": {
+      "t2va": "",
+      "i2va": "",
+      "fl2va": "",
+      "ref2va": ""
+    },
+    "profiles": {
+      "i2va": {
+        "unet": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "clip": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "video_vae": "minimax_h3_video_vae_int8_convrot.safetensors",
+        "audio_vae": "minimax_h3_audio_vae_fp32.safetensors",
+        "steps": 8,
+        "allow_task_steps": true,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "sage_attention": "sageattn3",
+        "allow_compile": false,
+        "shift_video": 12,
+        "shift_audio": 3
+      },
+      "fl2va": {
+        "unet": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "clip": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "video_vae": "minimax_h3_video_vae_int8_convrot.safetensors",
+        "audio_vae": "minimax_h3_audio_vae_fp32.safetensors",
+        "steps": 8,
+        "allow_task_steps": true,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "sage_attention": "sageattn3",
+        "allow_compile": false,
+        "shift_video": 12,
+        "shift_audio": 3
+      },
+      "ref2va": {
+        "unet": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "clip": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "video_vae": "minimax_h3_video_vae_int8_convrot.safetensors",
+        "audio_vae": "minimax_h3_audio_vae_fp32.safetensors",
+        "steps": 20,
+        "allow_task_steps": false,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "sage_attention": "sageattn3",
+        "allow_compile": false,
+        "shift_video": 12,
+        "shift_audio": 3
+      }
+    }
   }
 }

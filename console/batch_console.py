@@ -536,14 +536,27 @@ def start_assemble_job(project_name="", selection=None, seg_range=None):
 
 # ---------- 图构建与提交 ----------
 
-def build_graphs(tasks):
+def _load_h3_modules():
     if not os.path.isdir(DEFAULT_WORKFLOW_DIR):
-        return None, f"找不到工作流目录：{DEFAULT_WORKFLOW_DIR}"
-    sys.path.insert(0, DEFAULT_WORKFLOW_DIR)
+        raise RuntimeError(f"找不到工作流目录：{DEFAULT_WORKFLOW_DIR}")
+    if DEFAULT_WORKFLOW_DIR not in sys.path:
+        sys.path.insert(0, DEFAULT_WORKFLOW_DIR)
+    import build_api_graphs as bg
+    import h3_workflow_adapter as h3a
+    return bg, h3a
+
+
+def build_graphs(tasks):
+    """Build API graphs through a semantic H3 adapter.
+
+    Business code deals in t2va/i2va/fl2va/ref2va semantics. Concrete node ids
+    stay inside the workflow/template layer.
+    """
     try:
-        import build_api_graphs as bg
+        bg, h3a = _load_h3_modules()
     except Exception as e:
-        return None, f"无法加载 build_api_graphs.py：{e}"
+        return None, f"无法加载 H3 工作流模块：{e}"
+
     out = []
     for i, t in enumerate(tasks):
         try:
@@ -552,25 +565,77 @@ def build_graphs(tasks):
             task.setdefault("seed", random.randrange(10 ** 15))
             task.setdefault("mp", 1.0)
             task.setdefault("duration", 10)
+            mode = h3a.resolve_mode(task)
+            task["resolved_mode"] = mode
+
             if task.get("chain_waiting"):
-                g = None
-            elif task["mode"] == "t2v":
-                g = bg.convert_t2v(task)
-            elif task["mode"] == "i2v":
-                if not task.get("image"):
-                    return None, f"任务 {task['id']} 是 I2V 模式但未选首帧图"
-                g = bg.build_i2v(task)
-            elif task["mode"] == "r2v":
-                if not task.get("images"):
-                    return None, f"任务 {task['id']} 是 R2V 模式但未选参考图"
-                g = bg.build_r2v(task)
+                graph = None
             else:
-                return None, f"未知模式：{task['mode']}"
-            out.append((task, g))
+                # Preferred: an exported API workflow selected in config.json.
+                graph = h3a.load_custom_workflow(mode)
+
+                # Compatibility fallback: reuse the original builders, then
+                # normalize them to the same stable profile.
+                if graph is None:
+                    if mode == "t2va":
+                        graph = bg.convert_t2v(task)
+                    elif mode in ("i2va", "fl2va"):
+                        if not task.get("image"):
+                            return None, f"任务 {task['id']} 是 {mode.upper()} 模式但未选首帧图"
+                        if mode == "fl2va" and not task.get("last_frame"):
+                            return None, f"任务 {task['id']} 是 FL2VA 模式但未选尾帧图"
+                        graph = bg.build_i2v(task)
+                    elif mode == "ref2va":
+                        if not task.get("images"):
+                            return None, f"任务 {task['id']} 是 Ref2VA 模式但未选参考图"
+                        graph = bg.build_r2v(task)
+                    else:
+                        return None, f"未知模式：{mode}"
+
+                graph = h3a.adapt_graph(graph, task, mode)
+            out.append((task, graph))
         except Exception as e:
             return None, f"构建任务 {t.get('id', t.get('name'))} 失败：{e}"
     return out, None
 
+
+def _upload_task_media(server, task):
+    """Upload exactly the media required by the resolved H3 mode."""
+    _, h3a = _load_h3_modules()
+    mode = h3a.resolve_mode(task)
+
+    def upload_named(value, label):
+        name = str(value or "").strip()
+        if not name:
+            raise RuntimeError(f"{label}为空")
+        local_path = find_image(name)
+        if not local_path:
+            raise RuntimeError(f"本地找不到{label}：{name}")
+        try:
+            upload_image(server, local_path, name)
+        except Exception as e:
+            raise RuntimeError(f"上传{label} {name} 失败：{e}") from e
+
+    if mode in ("i2va", "fl2va"):
+        upload_named(task.get("image"), "首帧图")
+        if mode == "fl2va":
+            upload_named(task.get("last_frame"), "尾帧图")
+    elif mode == "ref2va":
+        for image in (task.get("images") or []):
+            upload_named(image, "参考图")
+
+
+def _build_and_submit_single(server, task):
+    """Single entry point used by normal submit and the chain daemon."""
+    graphs, err = build_graphs([task])
+    if err:
+        raise RuntimeError(err)
+    built_task, graph = graphs[0]
+    resp = api_post(server, "/prompt", {"prompt": graph, "client_id": "batch_console"})
+    pid = resp.get("prompt_id") if resp else None
+    if not pid:
+        raise RuntimeError(f"服务器返回异常：{resp}")
+    return pid, built_task
 
 def _slug(name):
     keep = "".join(ch for ch in str(name) if ch.isalnum() or ch in "_-")
@@ -855,7 +920,7 @@ def enhance_prompt(prompt, task=None):
 
     # 1. 对齐指令：I2V 首帧对齐；R2V 不再注入"Picture 1 首帧"（改由六段式
     #    subject_definitions + keyframe 声明负责，见 to_ref2va_six_section）
-    if mode == "i2v" and not has_align and refs:
+    if mode in ("i2v", "i2va", "fl2v", "fl2va") and not has_align and refs:
         header = (
             "目标视频的第 0.00 秒完全参照 <Picture 1>（来自 [Shot 1]）。\n\n"
         )
@@ -916,7 +981,7 @@ def enhance_prompt(prompt, task=None):
     # 6b. 分镜图构图引用：参考图里有分镜图时，明确其构图/机位/人物站位基准作用
     #     （仅非 R2V 模式注入；R2V 由六段式 <Picture N> 故事板声明负责）
     for idx, img in enumerate(refs):
-        if mode != "r2v" and (str(img).startswith("分镜_") or str(img).startswith("story_")):
+        if mode not in ("r2v", "ref2v", "ref2va") and (str(img).startswith("分镜_") or str(img).startswith("story_")):
             pic = idx + 1
             comp = (
                 f" 本镜构图、机位、景别、人物站位与画面内容严格参照 <Picture {pic}>（分镜图）；"
@@ -1006,7 +1071,7 @@ def extract_last_frame(video_path):
     out_png = os.path.join(tmpdir, "last.png")
     shutil.copy(video_path, tmp_video)
     r = subprocess.run(
-        ["ffmpeg", "-y", "-sseof", "-0.1", "-i", tmp_video, "-frames:v", "1", out_png],
+        ["ffmpeg", "-y", "-sseof", "-1", "-i", tmp_video, "-vf", "reverse", "-frames:v", "1", out_png],
         capture_output=True,
     )
     if r.returncode != 0 or not os.path.exists(out_png):
@@ -1016,62 +1081,48 @@ def extract_last_frame(video_path):
 
 def submit_tasks(server, tasks, auto_download=True, chain_mode=False, role_images=None, scene_image=None):
     warnings = []
-    # R2V 任务：三段式 → 官方六段式（仅本次会直接提交的段；链式等待段保持三段式，
-    # 后续由 advance_chain 转 I2V 使用）
+    try:
+        _, h3a = _load_h3_modules()
+    except Exception as e:
+        return None, f"无法加载 H3 workflow adapter：{e}", warnings
+    # Ref2VA 任务：三段式 → 官方六段式。链式等待段后续会根据
+    # 是否存在真实尾帧自动进入 I2VA / FL2VA。
     for idx, t in enumerate(tasks):
-        if t.get("mode") == "r2v" and (t.get("images") or []):
+        if h3a.resolve_mode(t) == "ref2va" and (t.get("images") or []):
             is_waiting = bool(t.get("chain_waiting")) or (bool(chain_mode) and idx > 0)
             if not is_waiting:
                 t["prompt"] = to_ref2va_six_section(t.get("prompt", ""), t)
     # R2V 模型预检：ref2va 权重缺失时回退 fl2va_pruned 并提示
     r2v_cfg = (_CONFIG.get("models") or {}).get("r2v") or {}
     want_unet = r2v_cfg.get("unet") or "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
-    want_clip = r2v_cfg.get("clip") or "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors"
-    if any(t.get("mode") == "r2v" and not (
+    want_clip = r2v_cfg.get("clip") or "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+    if any(h3a.resolve_mode(t) == "ref2va" and not (
         bool(t.get("chain_waiting")) or (bool(chain_mode) and i > 0)
     ) for i, t in enumerate(tasks)):
         unets, clips = _server_models(server)
-        use_unet, use_clip = want_unet, want_clip
-        if unets:
-            if want_unet not in unets:
-                use_unet = "minimax_h3_fl2va_pruned_int8_convrot.safetensors" if "minimax_h3_fl2va_pruned_int8_convrot.safetensors" in unets else unets[0]
-                warnings.append(
-                    f"⚠️ 服务器模型列表里没有 {want_unet}，R2V 暂回退 {use_unet}（身份锁定弱）。"
-                    "文件放对位置后重启 ComfyUI 即可生效。"
-                )
-        if clips:
-            if want_clip not in clips:
-                use_clip = clips[0]
-                warnings.append(f"⚠️ 缺少 CLIP {want_clip}，R2V 暂用 {use_clip}。")
+        if unets and want_unet not in unets:
+            return None, (
+                f"Ref2VA 需要 {want_unet}，但服务器未发现该权重。"
+                "已阻断提交，避免把 FL2VA 权重错误接到 Ref2VA conditioning。"
+            ), warnings
+        if clips and want_clip not in clips:
+            return None, f"Ref2VA 需要文本编码器 {want_clip}，服务器未发现。", warnings
         for t in tasks:
-            if t.get("mode") == "r2v":
-                t["r2v_unet"] = use_unet
-                t["r2v_clip"] = use_clip
+            if h3a.resolve_mode(t) == "ref2va":
+                t["r2v_unet"] = want_unet
+                t["r2v_clip"] = want_clip
     graphs, err = build_graphs(tasks)
     if err:
         return None, err, warnings
-    # I2V 任务先上传首帧图
+    # Upload only real media required by the selected mode. An empty
+    # last_frame is I2VA; never manufacture an end-frame placeholder.
     for task, _ in graphs:
         if task.get("chain_waiting"):
             continue
-        if task["mode"] == "i2v" and task.get("image"):
-            lp = find_image(task["image"])
-            if lp:
-                try:
-                    upload_image(server, lp, task["image"])
-                except Exception as e:
-                    return None, f"上传首帧图 {task['image']} 失败：{e}", warnings
-            else:
-                return None, f"本地找不到首帧图：{task['image']}", warnings
-        if task["mode"] == "r2v":
-            for img in (task.get("images") or []):
-                lp = find_image(img)
-                if not lp:
-                    return None, f"本地找不到参考图：{img}", warnings
-                try:
-                    upload_image(server, lp, img)
-                except Exception as e:
-                    return None, f"上传参考图 {img} 失败：{e}", warnings
+        try:
+            _upload_task_media(server, task)
+        except Exception as e:
+            return None, str(e), warnings
 
     state = load_state()
     state["server"] = server
@@ -1175,12 +1226,14 @@ def submit_tasks(server, tasks, auto_download=True, chain_mode=False, role_image
             "id": tid,
             "name": task.get("name", tid),
             "mode": task.get("mode"),
+            "resolved_mode": task.get("resolved_mode"),
             "quality": task.get("quality"),
             "steps": task.get("steps"),
             "duration": task.get("duration"),
             "mp": task.get("mp"),
             "prefix": task.get("prefix"),
             "image": task.get("image"),
+            "last_frame": task.get("last_frame"),
             "images": task.get("images") or [],
             "story_image": task.get("story_image"),
             "ref_video": task.get("ref_video"),
@@ -1419,72 +1472,93 @@ def get_status(server):
 
 
 def advance_chain(server, state):
-    """链式衔接：上一段完成并下载后，抽最后一帧上传，提交下一段。"""
+    """Advance a chain using the previous clip's last frame as the next first frame.
+
+    If the next shot has a real last_frame, it runs FL2VA. Otherwise it runs
+    I2VA. Missing tails are represented by absence, never by placeholder media.
+    """
     tasks = state.get("tasks", [])
     changed = False
     by_id = {t.get("id"): t for t in tasks}
+
+    def upload_optional_last(nxt):
+        last_frame = str(nxt.get("last_frame") or "").strip()
+        if not last_frame:
+            return ""
+        local_path = find_image(last_frame)
+        if not local_path:
+            raise RuntimeError(f"本地找不到尾帧图：{last_frame}")
+        upload_image(server, local_path, last_frame)
+        return last_frame
+
+    def make_chain_task(nxt, chain_img, prompt_text):
+        last_frame = str(nxt.get("last_frame") or "").strip()
+        return {
+            "id": nxt["id"],
+            "name": nxt.get("name", nxt["id"]),
+            "mode": "fl2va" if last_frame else "i2v",
+            "prompt": ensure_i2v_prompt(prompt_text),
+            "quality": nxt.get("quality"),
+            "steps": nxt.get("steps"),
+            "duration": nxt.get("duration", 10),
+            "mp": nxt.get("mp", 1.0),
+            "prefix": nxt.get("prefix", ""),
+            "image": chain_img,
+            "last_frame": last_frame,
+            "seed": random.randrange(10 ** 15),
+        }
+
     for i, nxt in enumerate(tasks):
         if not nxt.get("chain_waiting") or nxt.get("prompt_id"):
             continue
-        # 按 chain_prev 找上一段（支持重新生成指定上一段）；无则取列表前一个
-        t = by_id.get(nxt.get("chain_prev")) if nxt.get("chain_prev") else None
-        if t is None and i > 0:
-            t = tasks[i - 1]
-        if t is None:
+        prev = by_id.get(nxt.get("chain_prev")) if nxt.get("chain_prev") else None
+        if prev is None and i > 0:
+            prev = tasks[i - 1]
+        if prev is None or prev.get("chain_done") or not prev.get("prompt_id"):
             continue
-        if t.get("chain_done"):
-            continue
-        if not t.get("prompt_id"):
-            continue
-        # 上一段失败/超时：标记跳过，链条继续（下一段降级 T2V 或用更早成功帧）
-        if t.get("error"):
-            t["chain_done"] = True
-            t["chain_skipped"] = True
-            # 找更早的成功段末帧
+
+        # A failed predecessor does not poison the chain: use the newest earlier
+        # local success if possible; otherwise fall back to T2VA.
+        if prev.get("error"):
+            prev["chain_done"] = True
+            prev["chain_skipped"] = True
             ref = None
             for j in range(i - 1, -1, -1):
-                prev = tasks[j]
-                if prev.get("output_file") and os.path.exists(
-                    os.path.join(OUTPUTS_DIR, prev["output_file"]["type"], prev["output_file"]["subfolder"], prev["output_file"]["filename"])
-                ):
-                    ref = prev
+                candidate = tasks[j]
+                of = candidate.get("output_file")
+                if not of:
+                    continue
+                path = os.path.join(OUTPUTS_DIR, of["type"], of["subfolder"], of["filename"])
+                if os.path.exists(path):
+                    ref = candidate
                     break
             if ref:
+                of = ref["output_file"]
                 png = extract_last_frame(os.path.join(
-                    OUTPUTS_DIR, ref["output_file"]["type"], ref["output_file"]["subfolder"], ref["output_file"]["filename"]
+                    OUTPUTS_DIR, of["type"], of["subfolder"], of["filename"]
                 ))
                 if png:
                     chain_img = f"chain_{ref['id']}.png"
                     try:
                         upload_image(server, png, chain_img)
-                        task = {
-                            "id": nxt["id"], "name": nxt.get("name", nxt["id"]),
-                            "mode": "i2v", "prompt": ensure_i2v_prompt(nxt.get("prompt", "")),
-                            "quality": nxt.get("quality"),
-                            "steps": nxt.get("steps"),
-                            "duration": nxt.get("duration", 10), "mp": nxt.get("mp", 1.0),
-                            "prefix": nxt.get("prefix", ""), "image": chain_img,
-                            "seed": random.randrange(10 ** 15),
-                        }
-                        sys.path.insert(0, DEFAULT_WORKFLOW_DIR)
-                        import build_api_graphs as bg
-                        g = bg.build_i2v(task)
-                        resp = api_post(server, "/prompt", {"prompt": g, "client_id": "batch_console"})
-                        pid = resp.get("prompt_id") if resp else None
-                        if pid:
-                            nxt["prompt_id"] = pid
-                            nxt["submitted_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                            nxt["chain_waiting"] = False
-                            nxt["image"] = chain_img
-                            changed = True
-                            print(f"[chain] {t.get('name')} 失败跳过，{nxt.get('name')} 用 {ref.get('name')} 末帧续接（{pid}）")
-                            continue
+                        upload_optional_last(nxt)
+                        task = make_chain_task(nxt, chain_img, nxt.get("prompt", ""))
+                        pid, built = _build_and_submit_single(server, task)
+                        nxt.update({
+                            "prompt_id": pid,
+                            "submitted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "chain_waiting": False,
+                            "image": chain_img,
+                            "mode": task["mode"],
+                            "resolved_mode": built.get("resolved_mode"),
+                        })
+                        changed = True
+                        print(f"[chain] {prev.get('name')} 失败跳过，{nxt.get('name')} 用 {ref.get('name')} 末帧续接（{pid}）")
+                        continue
                     except Exception as e:
                         print(f"[chain] 失败跳过续接异常：{e}")
-            # 无可用参考帧 → 降级 T2V 直接提交
+
             try:
-                sys.path.insert(0, DEFAULT_WORKFLOW_DIR)
-                import build_api_graphs as bg
                 task = {
                     "id": nxt["id"], "name": nxt.get("name", nxt["id"]),
                     "mode": "t2v", "prompt": nxt.get("prompt", ""),
@@ -1492,22 +1566,22 @@ def advance_chain(server, state):
                     "prefix": nxt.get("prefix", ""), "image": "",
                     "seed": random.randrange(10 ** 15),
                 }
-                g = bg.convert_t2v(task)
-                resp = api_post(server, "/prompt", {"prompt": g, "client_id": "batch_console"})
-                pid = resp.get("prompt_id") if resp else None
-                if pid:
-                    nxt["prompt_id"] = pid
-                    nxt["submitted_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                    nxt["chain_waiting"] = False
-                    nxt["mode"] = "t2v"
-                    nxt["image"] = ""
-                    changed = True
-                    print(f"[chain] {t.get('name')} 失败跳过，{nxt.get('name')} 降级 T2V 提交（{pid}）")
+                pid, built = _build_and_submit_single(server, task)
+                nxt.update({
+                    "prompt_id": pid,
+                    "submitted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "chain_waiting": False,
+                    "mode": "t2v",
+                    "resolved_mode": built.get("resolved_mode"),
+                    "image": "",
+                })
+                changed = True
+                print(f"[chain] {prev.get('name')} 失败跳过，{nxt.get('name')} 降级 T2VA 提交（{pid}）")
             except Exception as e:
                 print(f"[chain] 降级提交异常：{e}")
             continue
-        # 本地视频（未下载则补下载）
-        of = t.get("output_file")
+
+        of = prev.get("output_file")
         if not of:
             continue
         video_file = os.path.join(OUTPUTS_DIR, of["type"], of["subfolder"], of["filename"])
@@ -1521,85 +1595,44 @@ def advance_chain(server, state):
             except Exception as e:
                 print(f"[chain] 补下载失败：{e}")
                 continue
+
         png = extract_last_frame(video_file)
         if not png:
-            print(f"[chain] 抽帧失败：{t.get('name')}")
+            print(f"[chain] 抽帧失败：{prev.get('name')}")
             continue
-        chain_img = f"chain_{t['id']}.png"
+        chain_img = f"chain_{prev['id']}.png"
         try:
             upload_image(server, png, chain_img)
+            upload_optional_last(nxt)
         except Exception as e:
-            print(f"[chain] 上传失败：{e}")
+            print(f"[chain] 上传链式帧失败：{e}")
             continue
-        # 下一段：链式参考图 = 上段末帧（P1，首帧对齐）+ 本段场景 + 角色锚点。
-        # 去掉分镜图：分镜图场景可能与上段末帧不同，混在一起会让 H3 生成场景切换
-        base_refs = [x for x in (nxt.get("images") or []) if x and not str(x).startswith("chain_")]
-        ref_imgs = [x for x in base_refs if not (str(x).startswith("分镜_") or str(x).startswith("story_"))]
-        ref_imgs = list(dict.fromkeys(ref_imgs[:3]))
-        if chain_img not in ref_imgs:
-            ref_imgs.insert(0, chain_img)  # 链帧放第一位：首帧对齐 + 构图延续
-        # 链式提示词：首帧延续上一段末帧，整段保持单一场景
+
         chain_prompt = str(nxt.get("prompt") or "")
         if chain_prompt and "不切换场景" not in chain_prompt:
-            chain_prompt = (
-                " 首帧严格延续上一段末帧的场景、人物位置与光线；"
-                "整段画面保持单一场景，不出现场景切换、不出现其他地点。"
-            ).join([chain_prompt, ""]) if False else chain_prompt + (
+            chain_prompt += (
                 " 首帧严格延续上一段末帧的场景、人物位置与光线；"
                 "整段画面保持单一场景，不出现场景切换、不出现其他地点。"
             )
-        # 关键：waiting 任务从未提交过，其参考图（锚点/场景/分镜）还没上传到远程，
-        # 必须在上传链帧之外把所有本地参考图也上传，否则 POST /prompt 会 400
-        for img in ref_imgs:
-            lp = find_image(img)
-            if lp:
-                try:
-                    upload_image(server, lp, img)
-                except Exception as e:
-                    print(f"[chain] 上传参考图失败 {img}: {e}")
-        sys.path.insert(0, DEFAULT_WORKFLOW_DIR)
+        task = make_chain_task(nxt, chain_img, chain_prompt)
         try:
-            import build_api_graphs as bg
-        except Exception as e:
-            print(f"[chain] 加载 build_api_graphs 失败：{e}")
-            continue
-        # 链式衔接统一用 I2V：上段末帧作为本段首帧图，画面从上帧直接发展（最连贯）。
-        # R2V 多参考下 H3 不保证从链帧开始，段间会跳变。
-        task = {
-            "id": nxt["id"],
-            "name": nxt.get("name", nxt["id"]),
-            "mode": "i2v",
-            "prompt": ensure_i2v_prompt(chain_prompt),
-            "quality": nxt.get("quality"),
-            "steps": nxt.get("steps"),
-            "duration": nxt.get("duration", 10),
-            "mp": nxt.get("mp", 1.0),
-            "prefix": nxt.get("prefix", ""),
-            "image": chain_img,
-            "story_image": nxt.get("story_image"),
-            "ref_video": nxt.get("ref_video"),
-            "seed": random.randrange(10 ** 15),
-        }
-        build_fn = bg.build_i2v
-        try:
-            g = build_fn(task)
-            resp = api_post(server, "/prompt", {"prompt": g, "client_id": "batch_console"})
+            pid, built = _build_and_submit_single(server, task)
         except Exception as e:
             print(f"[chain] 提交下一段失败：{e}")
             continue
-        pid = resp.get("prompt_id") if resp else None
-        if not pid:
-            print(f"[chain] 下一段提交异常：{resp}")
-            continue
-        nxt["prompt_id"] = pid
-        nxt["submitted_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        nxt["chain_waiting"] = False
-        nxt["image"] = chain_img
-        nxt["images"] = []
-        nxt["mode"] = "i2v"
-        t["chain_done"] = True
+
+        nxt.update({
+            "prompt_id": pid,
+            "submitted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "chain_waiting": False,
+            "image": chain_img,
+            "images": [],
+            "mode": task["mode"],
+            "resolved_mode": built.get("resolved_mode"),
+        })
+        prev["chain_done"] = True
         changed = True
-        print(f"[chain] {t.get('name')} → {nxt.get('name')} 已提交（{pid}）")
+        print(f"[chain] {prev.get('name')} → {nxt.get('name')} 已提交（{built.get('resolved_mode') or task['mode']}，{pid}）")
     return changed
 
 
@@ -2925,14 +2958,15 @@ def verify_asset(image_path, kind, expected=None, timeout=120):
     try:
         content = vision_ask(image_path, q, timeout)
     except Exception as e:
-        return {"ok": True, "issues": [], "error": f"质检服务不可用：{e}"}
+        return {"ok": False, "status": "unknown", "issues": [], "error": f"质检服务不可用：{e}"}
     data = _extract_json_obj(content) or {}
     if not data:
-        return {"ok": True, "issues": [], "error": "质检返回无法解析（保守放行）"}
+        return {"ok": False, "status": "unknown", "issues": [], "error": "质检返回无法解析；已阻断自动放行"}
     issues = data.get("issues") or []
     if not isinstance(issues, list):
         issues = [issues]
-    return {"ok": bool(data.get("ok")), "issues": [str(x) for x in issues][:5]}
+    passed = bool(data.get("ok"))
+    return {"ok": passed, "status": "pass" if passed else "fail", "issues": [str(x) for x in issues][:5]}
 
 
 def llm_expand_storyboards(data, token=""):
@@ -4743,7 +4777,17 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8890
+    lifecycle = None
+    if os.name == "nt":
+        from windows_lifecycle import Service
+        lifecycle = Service("batch_console")
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    if lifecycle:
+        srv.daemon_threads = False
+        def stop_server():
+            lifecycle.stopped.wait()
+            srv.shutdown()
+        threading.Thread(target=stop_server, daemon=True).start()
     print(f"ComfyUI 批量控制台已启动：http://127.0.0.1:{port}")
     print(f"工作流目录：{DEFAULT_WORKFLOW_DIR}")
     print(f"默认服务器：{DEFAULT_SERVER}")
@@ -4751,6 +4795,10 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止")
+    finally:
+        srv.server_close()
+        if lifecycle:
+            lifecycle.close()
 
 
 if __name__ == "__main__":

@@ -40,3 +40,8 @@ workflows/__pycache__/
 # ---- 系统 ----
 .DS_Store
 Thumbs.db
+
+# Local Windows launch/verification artifacts
+console/.windows-runtime.json
+local-launcher-logs/
+local-validation/

@@ -411,17 +411,18 @@
       <div class="desc">勾选链式衔接则上段末帧自动接下一段首帧；提交后实时监控。</div>
       <div class="row">
         <label style="font-size:13px"><input type="checkbox" id="chainMode"> 🔗 链式衔接（上段末帧 → 下段首帧）</label>
+        <label style="font-size:13px"><input type="checkbox" id="fl2vaStoryEnd" checked> 🎯 链式镜头有分镜图时把它作为真实尾帧（FL2VA）；没有则自动 I2VA</label>
         <div class="hint" style="font-size:11px;margin:2px 0 8px 0;width:100%">
           ⚠️ 连续剧情**中间段必须**承接上一段末帧，否则人物/场景会跳变。多段时默认勾选（第 2 段起自动用上段末帧接本段首帧）；每段独立场景的短剧可取消。
         </div>
-        <label style="font-size:13px"><input type="checkbox" id="qualityMode" checked> 🎧 成片质量（无加速LoRA·20步，声音清晰，慢）</label>
+        <label style="font-size:13px"><input type="checkbox" id="qualityMode" checked> 🎧 当前稳定链路（FL2VA/I2VA：无 Turbo LoRA · SageAttn3 · 默认 8 步）</label>
         <label style="font-size:13px">步数
           <select id="stepsMode" style="width:150px">
             <option value="4">4（极速预览）</option>
             <option value="6">6（加速成片）</option>
-            <option value="8">8（加速成片）</option>
+            <option value="8" selected>8（当前 FL2VA/I2VA 基线）</option>
             <option value="10">10</option>
-            <option value="20" selected>20（成片默认）</option>
+            <option value="20">20（Ref2VA / 基础模式）</option>
             <option value="30">30（更精细）</option>
             <option value="50">50（最精细·慢）</option>
           </select>
@@ -896,6 +897,7 @@ function autoSaveProject(silent) {
         role_images: [$('roleImage1').value, $('roleImage2').value].filter(Boolean),
         scene_image: $('sceneImage').value || null,
         chain_mode: $('chainMode').checked,
+        fl2va_story_end: $('fl2vaStoryEnd') ? $('fl2vaStoryEnd').checked : true,
         asset_imgs: assetImgs,
         asset_prompts: assetPrompts,
         asset_meta: assetMeta,
@@ -1109,7 +1111,7 @@ function scriptToTasks(script) {
   const sb = script.storyboard_list || [];
   return sb.map((s, i) => ({
     name: `${script.title || '剧本'}_${String(i+1).padStart(2,'0')}`,
-    mode: 't2v', duration: s.duration || 10, mp: 1.0, image: '', images: [],
+    mode: 't2v', duration: s.duration || 10, mp: 1.0, image: '', last_frame: '', images: [],
     roles: s.roles || [], scene: s.scene || '',
     story_image: assetImgs.story[i] || '',
     ref_video: $('refVideo') ? ($('refVideo').value || null) : null,
@@ -1312,10 +1314,16 @@ function renderPreview() {
     const missing = [];
     if (!hasDesc) missing.push('画面描述'); if (!hasSound) missing.push('环境声'); if (!hasMusic) missing.push('配乐字段');
     const warn = missing.length ? `<div style="color:var(--red);font-size:12px;margin-top:6px">⚠️ 缺少：${missing.join('、')}</div>` : '';
-    // 提交时实际会用的参考图（与 submit 逻辑一致）
     const refs = effectiveRefs(i);
-    const mode = refs.length ? `R2V ${refs.length} 参考` : 'T2V 文生';
-    const refText = refs.length ? refs.join('、') : '无（纯文生视频，人物一致性靠提示词）';
+    const storyFrame = assetImgs.story[i] || '';
+    const chaining = $('chainMode').checked && i > 0;
+    const useStoryEnd = chaining && storyFrame && $('fl2vaStoryEnd') && $('fl2vaStoryEnd').checked;
+    const mode = chaining
+      ? (useStoryEnd ? 'FL2VA · 上一镜末帧 → 本镜分镜尾帧' : 'I2VA · 上一镜末帧')
+      : (storyFrame ? 'I2VA · 分镜图首帧' : (refs.length ? `Ref2VA · ${refs.length} 张参考` : 'T2VA'));
+    const refText = storyFrame
+      ? (chaining ? (useStoryEnd ? `首帧=上一镜末帧；尾帧=${storyFrame}` : '首帧=上一镜末帧；无尾帧') : `首帧=${storyFrame}`)
+      : (refs.length ? refs.join('、') : '无');
     return `<div class="card-item">
       <div class="r1"><span class="name">${esc(t.name)}</span><span class="pill ${missing.length?'error':'completed'}">${missing.length?'待补':'完整'}</span></div>
       <div class="meta">${t.duration}s · ${t.mp}MP · ${parseInt($('stepsMode').value)||''}步 · 提交模式：${mode}</div>
@@ -1328,9 +1336,8 @@ function renderPreview() {
 const MAX_REF_IMAGES = 8;  // 与 config.json console.max_ref_images 对齐（官方 Ref2VA 上限 9）
 
 function effectiveRefs(i) {
-  // 提交时实际参考图（官方 Ref2VA 语义）：
-  // 顺序 = 本段出场角色多视图（正→脸→侧→背）→ 场景图 → 分镜图（故事板，非首帧）→ 手动补充。
-  // 分镜图不再当首帧；链式段（第 2 段起）走 I2V，只带上段末帧。
+  // Ref2VA 备用参考集：角色多视图 → 场景图 → 分镜图 → 手动补充。
+  // 优先有分镜关键帧时走 I2VA/FL2VA；缺少关键帧时才回退 Ref2VA。
   const roles = (currentScript && currentScript.role_list) || [];
   const sb = (currentScript && currentScript.storyboard_list) || [];
   const seg = sb[i] || {};
@@ -1364,15 +1371,39 @@ async function submit() {
   // 一键分辨率覆盖
   const globalMp = $('submitMp').value;
   if (globalMp) tasks = tasks.map(t => ({...t, mp: parseFloat(globalMp)}));
-  // 按参考资产自动定模式：角色/场景/分镜图 ≥2 → R2V；1 张 → I2V；无 → T2V
+  // 语义模式选择：
+  // 首镜有分镜关键帧 -> I2VA；链式后续镜由 daemon 用上一镜末帧做首帧，
+  // 若本镜有分镜图则把它作为真实尾帧走 FL2VA；否则 I2VA。
+  // 没关键帧但有角色/场景参考才回退 Ref2VA；都没有则 T2VA。
   tasks = tasks.map((t, i) => {
     const refs = effectiveRefs(i);
-    t.story_image = assetImgs.story[i] || '';
+    const storyFrame = assetImgs.story[i] || '';
+    const chaining = $('chainMode').checked && i > 0;
+    t.story_image = storyFrame;
     t.ref_video = $('refVideo').value || null;
     t.quality = $('qualityMode').checked ? 'final' : 'preview';
     t.steps = parseInt($('stepsMode').value) || undefined;
-    if (refs.length) { t.mode = 'r2v'; t.images = refs.slice(0, MAX_REF_IMAGES); t.image = ''; }
-    else { t.mode = 't2v'; t.image = ''; t.images = []; }
+    t.last_frame = (chaining && storyFrame && $('fl2vaStoryEnd') && $('fl2vaStoryEnd').checked)
+      ? storyFrame
+      : '';
+
+    if (chaining) {
+      t.mode = 'i2v';
+      t.image = '';
+      t.images = [];
+    } else if (storyFrame) {
+      t.mode = 'i2v';
+      t.image = storyFrame;
+      t.images = [];
+    } else if (refs.length) {
+      t.mode = 'r2v';
+      t.images = refs.slice(0, MAX_REF_IMAGES);
+      t.image = '';
+    } else {
+      t.mode = 't2v';
+      t.image = '';
+      t.images = [];
+    }
     return t;
   });
   tasks = tasks.map((t, i) => ({...t, chain_prev: $('chainMode').checked && i > 0, chain_waiting: $('chainMode').checked && i > 0}));
@@ -2103,6 +2134,7 @@ function applyProjectSelections() {
     $('sceneImage').value = p.scene_image;
   }
   if (typeof p.chain_mode === 'boolean') $('chainMode').checked = p.chain_mode;
+  if ($('fl2vaStoryEnd') && typeof p.fl2va_story_end === 'boolean') $('fl2vaStoryEnd').checked = p.fl2va_story_end;
 }
 
 // ---------- ⑤ 参考资产 ----------
