@@ -11,6 +11,8 @@
 """
 
 import base64
+import copy
+import ai_bridge
 import csv
 import hashlib
 import io
@@ -48,12 +50,14 @@ _CONFIG_DEFAULTS = {
     "comfyui": {"server": "http://127.0.0.1:8188", "workflow_dir": "workflows"},
     "storage": {"output_dir": "comfyui_backup/outputs", "asset_dirs": ["素材", "出镜素材"]},
     "llm": {
+        "invocation_mode": "api",
         "provider": "local",
         "provider_type": "openai",
         "local": {"url": "http://127.0.0.1:1234", "model": "qwen3.6-27b-abliterated-mlx", "token": ""},
         "cloud": {"enabled": False, "base_url": "https://api.openai.com/v1", "api_key": "", "model": "gpt-4o-mini"},
     },
     "image_gen": {
+        "invocation_mode": "api",
         "provider": "local",
         "provider_type": "openai",
         "local": {"url": "http://127.0.0.1:8081"},
@@ -247,14 +251,24 @@ def load_state():
     base = {"server": DEFAULT_SERVER, "auto_download": True, "tasks": []}
     for k, v in base.items():
         data.setdefault(k, v)
+    ctx = ai_bridge.context()
+    if ctx:
+        data["project"] = copy.deepcopy(ctx["project"])
     return data
 
 
 def save_state(state):
     _ensure_db()
+    ctx = ai_bridge.context()
+    if ctx:
+        ctx["project"] = copy.deepcopy(state.get("project") or ctx["project"])
+        # Only AI progress belongs to this worker; never overwrite video tasks or another project.
+        state = {k: state[k] for k in ("lmstudio_token", "expand_task") if k in state}
     conn = _db_connect()
     try:
         with conn:
+            if ctx and ctx['path'] == '/api/expand_script' and 'prompt_tasks' in ctx['project']:
+                _finish_ai_job(conn, ctx, 200, {'tasks': ctx['project']['prompt_tasks']})
             for k, v in state.items():
                 if v is None:
                     conn.execute("DELETE FROM state WHERE key = ?", (k,))
@@ -2498,6 +2512,78 @@ def _extract_json_array(out):
         return []
 
 
+
+def _ai_config():
+    ctx = ai_bridge.context()
+    return ctx["config"] if ctx else _CONFIG
+
+
+def _ai_open(req, kind, timeout):
+    return ai_bridge.open_request(req, kind, timeout, _opener(), _ai_config())
+
+
+def _execute_ai_job(job):
+    handler = object.__new__(Handler)
+    handler.path = job["path"]
+    handler._read_json = lambda: copy.deepcopy(job["body"])
+    answer = []
+    handler._send = lambda code, body, *args: answer.append((code, json.loads(body)))
+    handler.do_POST()
+    return answer[-1]
+
+
+def _finish_ai_job(con, job, code, result):
+    if code != 200:
+        return
+    rows = con.execute("SELECT key,value FROM state WHERE key IN ('project','projects')").fetchall()
+    state = {r[0]: json.loads(r[1]) for r in rows}
+    projects = state.get("projects") or {}
+    current = state.get("project") or {}
+    name = job["project"].get("name", "")
+    proj = copy.deepcopy(current if current.get("name", "") == name else projects.get(name, job["project"]))
+    path, body = job["path"], job["body"]
+    if "script" in result:
+        if path == "/api/rewrite_script":
+            proj["script_before"] = body["script"]
+            proj["script_after"] = result["script"]
+        else:
+            proj["script_before"] = proj["current_script"] = result["script"]
+            if path == "/api/generate_script":
+                proj["script_after"] = None
+    if "tasks" in result and path == "/api/expand_script":
+        proj["prompt_tasks"] = result["tasks"]
+    ctx = body.get("_ai_context") or {}
+    kind, key = ctx.get("kind"), str(ctx.get("key", ""))
+    if kind in ("role", "scene", "story"):
+        if "prompt" in result:
+            proj.setdefault("asset_prompts", {}).setdefault(kind, {})[key] = result["prompt"]
+        if result.get("filename"):
+            imgs = proj.setdefault("asset_imgs", {})
+            if kind != "role" or not ctx.get("view"):
+                imgs.setdefault(kind, {})[key] = result["filename"]
+            proj.setdefault("asset_meta", {}).setdefault(kind, {})[str(ctx.get("meta_key", key))] = {
+                "verified": result.get("verified", False), "issues": result.get("issues", []),
+                "attempts": result.get("attempts", 1)}
+            ast = proj.setdefault("asset_state", {})
+            view = ctx.get("view")
+            if kind == "role":
+                name0 = ctx.get("role_name", key)
+                role = ast.setdefault("roles", {}).setdefault(name0, {})
+                if view:
+                    imgs.setdefault("roleViews", {}).setdefault(name0, {})[view] = result["filename"]
+                    role.setdefault("views", {})[view] = result["filename"]
+                if not view or view == "front":
+                    imgs.setdefault("role", {})[name0] = role["reference"] = result["filename"]
+            elif kind == "scene":
+                ast.setdefault("scenes", {}).setdefault(key, {})["reference"] = result["filename"]
+    proj["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    if name:
+        projects[name] = proj
+        con.execute("INSERT OR REPLACE INTO state(key,value) VALUES('projects',?)", (json.dumps(projects, ensure_ascii=False),))
+    if current.get("name", "") == name:
+        con.execute("INSERT OR REPLACE INTO state(key,value) VALUES('project',?)", (json.dumps(proj, ensure_ascii=False),))
+
+
 def _lm_token(body=None):
     """LM Studio API token：请求 body > 环境变量 > state 配置。"""
     if body and body.get("lmstudio_token"):
@@ -2539,7 +2625,7 @@ def _strip_v1(url):
 
 def _llm_endpoints():
     """返回 (主端点, 备用端点)；端点 dict：{url, api_key, model, provider}。"""
-    cfg = _CONFIG["llm"]
+    cfg = _ai_config()["llm"]
     ptype = str(cfg.get("provider_type") or "openai").strip() or "openai"
     local = {
         "url": str(cfg["local"]["url"] or "").rstrip("/"),
@@ -2577,7 +2663,7 @@ def _llm_openai(endpoint, messages, token="", timeout=1800):
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", **_lm_headers(api_key)},
     )
-    with _opener().open(req, timeout=timeout) as r:
+    with _ai_open(req, "llm", timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -2603,7 +2689,7 @@ def _llm_claude(endpoint, messages, token="", timeout=1800):
             "User-Agent": "batch-console",
         },
     )
-    with _opener().open(req, timeout=timeout) as r:
+    with _ai_open(req, "llm", timeout) as r:
         data = json.loads(r.read().decode("utf-8"))
     text = data["content"][0]["text"]
     return {"choices": [{"message": {"content": text}}]}
@@ -2624,7 +2710,7 @@ def _llm_dashscope(endpoint, messages, token="", timeout=1800):
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
     )
-    with _opener().open(req, timeout=timeout) as r:
+    with _ai_open(req, "llm", timeout) as r:
         data = json.loads(r.read().decode("utf-8"))
     text = data["output"]["choices"][0]["message"]["content"]
     return {"choices": [{"message": {"content": text}}]}
@@ -2648,6 +2734,8 @@ def _chat_once(endpoint, messages, token="", timeout=1800):
 
 
 def check_lmstudio(token="", timeout=6):
+    if _ai_config()["llm"].get("invocation_mode") == "manual":
+        return {"ok": True, "available": True, "provider": "manual", "models": [], "model": _lm_model()}
     main, backup = _llm_endpoints()
     for ep in [main, backup]:
         if not ep or not ep.get("url"):
@@ -2674,6 +2762,8 @@ def check_lmstudio(token="", timeout=6):
 
 
 def boogu_check(timeout=4):
+    if _ai_config()["image_gen"].get("invocation_mode") == "manual":
+        return {"ok": True, "provider": "manual", "models": []}
     try:
         req = urllib.request.Request(_v1(BOOGU_URL) + "/models", headers={"User-Agent": "batch-console"})
         with _opener().open(req, timeout=timeout) as r:
@@ -2685,7 +2775,7 @@ def boogu_check(timeout=4):
 
 def _image_gen_endpoints():
     """返回 (主端点, 备用端点)；image_gen 配置。"""
-    cfg = _CONFIG["image_gen"]
+    cfg = _ai_config()["image_gen"]
     ptype = str(cfg.get("provider_type") or "openai").strip() or "openai"
     local = {"url": str(cfg["local"]["url"] or "").rstrip("/"), "provider": "local", "provider_type": "openai"}
     cloud = {
@@ -2717,7 +2807,7 @@ def _img_openai(ep, prompt, filename, size="768x1024", timeout=300):
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", **_lm_headers(ep.get("api_key") or "")},
     )
-    with _opener().open(req, timeout=timeout) as r:
+    with _ai_open(req, "image_gen", timeout) as r:
         data = json.loads(r.read().decode("utf-8"))
     b64 = data["data"][0].get("b64_json")
     if not b64:
@@ -2756,7 +2846,7 @@ def _img_dashscope(ep, prompt, filename, size="768x1024", timeout=300):
             "X-DashScope-Async": "enable",
         },
     )
-    with _opener().open(req, timeout=timeout) as r:
+    with _ai_open(req, "image_gen", timeout) as r:
         task = json.loads(r.read().decode("utf-8"))
     task_id = task.get("output", {}).get("task_id")
     if not task_id:
@@ -2764,13 +2854,17 @@ def _img_dashscope(ep, prompt, filename, size="768x1024", timeout=300):
     # 轮询任务结果
     deadline = time.time() + 180
     while time.time() < deadline:
-        time.sleep(3)
+        if task_id != "manual":
+            time.sleep(3)
         q = urllib.request.Request(
             base + f"/api/v1/tasks/{task_id}",
             headers={"Authorization": f"Bearer {api_key}"},
         )
-        with _opener().open(q, timeout=timeout) as r:
-            st = json.loads(r.read().decode("utf-8"))
+        if task_id == "manual":
+            st = task
+        else:
+            with _opener().open(q, timeout=timeout) as r:
+                st = json.loads(r.read().decode("utf-8"))
         out = st.get("output", {})
         status = out.get("task_status")
         if status == "SUCCEEDED":
@@ -2821,11 +2915,11 @@ def _boogu_local(prompt, filename, size="768x1024", timeout=300):
     """调本地 Boogu-Image 生成图片并保存到 素材/ 目录。返回 (filename, 绝对路径)。"""
     payload = {"model": "boogu-image", "prompt": prompt, "size": size}
     req = urllib.request.Request(
-        BOOGU_URL + "/v1/images/generations",
+        _ai_config()["image_gen"]["local"]["url"].rstrip("/") + "/v1/images/generations",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "User-Agent": "batch-console"},
     )
-    with _opener().open(req, timeout=timeout) as r:
+    with _ai_open(req, "image_gen", timeout) as r:
         d = json.loads(r.read().decode("utf-8"))
     b64 = d.get("data", [{}])[0].get("b64_json")
     if not b64:
@@ -2898,7 +2992,7 @@ def vision_ask(image_path, prompt, timeout=120):
         data=json.dumps(payload).encode("utf-8"),
         headers=headers,
     )
-    with _opener().open(req, timeout=timeout) as r:
+    with _ai_open(req, "vision", timeout) as r:
         d = json.loads(r.read().decode("utf-8"))
     return d.get("choices", [{}])[0].get("message", {}).get("content", "")
 
@@ -3300,7 +3394,7 @@ def llm_expand_one(sb, role_map, token="", prev_prompt=""):
 
 def start_expand_job(text, token=""):
     """后台逐段扩写剧本 → 返回任务 id（前端轮询进度）。"""
-    tid = "expand_" + uuid.uuid4().hex[:10]
+    tid = "expand_" + (ai_bridge.context()["id"] if ai_bridge.context() else uuid.uuid4().hex[:10])
     job = {
         "status": "queued", "done": 0, "total": 0, "current": "",
         "error": None, "tasks": None, "meta": {},
@@ -3367,7 +3461,10 @@ def start_expand_job(text, token=""):
             job["error"] = str(e)
         finally:
             job["current"] = ""
-    threading.Thread(target=work, daemon=True).start()
+    if ai_bridge.context():
+        work()
+    else:
+        threading.Thread(target=work, daemon=True).start()
     return tid
 
 
@@ -3762,6 +3859,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path)
+        if path.path in ("/api/ai/work", "/api/ai/job"):
+            try:
+                data = ai_bridge.list_work() if path.path.endswith("work") else ai_bridge.get_job(urllib.parse.parse_qs(path.query).get("id", [""])[0])
+                self._send(200, json.dumps(data, ensure_ascii=False))
+            except ValueError as e:
+                self._send(404, json.dumps({"error": str(e)}, ensure_ascii=False))
+            return
+        if path.path == "/ai_manual.js":
+            with open(os.path.join(BASE_DIR, "ai_manual.js"), "r", encoding="utf-8") as f:
+                self._send(200, f.read(), "text/javascript; charset=utf-8")
+            return
         if path.path == "/":
             if not os.path.exists(INDEX_FILE):
                 self._send(404, "index.html 不存在", "text/plain; charset=utf-8")
@@ -3974,11 +4082,27 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, "not found", "text/plain; charset=utf-8")
 
     def do_POST(self):
+        global _CONFIG, _VISION_ENV
         path = urllib.parse.urlparse(self.path).path
         try:
             body = self._read_json()
         except Exception:
             self._send(400, json.dumps({"error": "JSON 解析失败"}, ensure_ascii=False))
+            return
+        if path in ("/api/ai/submit", "/api/ai/ack"):
+            try:
+                if path.endswith("submit"):
+                    ai_bridge.submit_result(body.get("id"), body.get("job"), body.get("text", ""), body.get("image", ""))
+                else:
+                    ai_bridge.acknowledge(body.get("job"))
+                self._send(200, json.dumps({"ok": True}))
+            except (ValueError, TypeError) as e:
+                self._send(400, json.dumps({"error": str(e)}, ensure_ascii=False))
+            return
+        if (path in ai_bridge.ROUTES and not ai_bridge.context()
+                and not (path == "/api/expand_script" and _CONFIG["llm"].get("invocation_mode", "api") == "api")):
+            jid = ai_bridge.submit_job(path, body, load_state().get("project") or {}, _CONFIG)
+            self._send(202, json.dumps({"ai_job": jid}))
             return
         if path == "/api/check":
             server = body.get("server", DEFAULT_SERVER)
@@ -4135,7 +4259,7 @@ class Handler(BaseHTTPRequestHandler):
                     shutil.copy(p, p + ".bak")
                 with open(p, "w", encoding="utf-8") as f:
                     json.dump(new_cfg, f, ensure_ascii=False, indent=2)
-                global _CONFIG, _VISION_ENV
+
                 _CONFIG = load_config()
                 # 端点/视觉读取 _CONFIG，保存后立即生效；静态常量重启后同步
                 _VISION_ENV = None
@@ -4262,7 +4386,12 @@ class Handler(BaseHTTPRequestHandler):
                 save_state(st)
             if body.get("async") and use_llm:
                 tid = start_expand_job(text, token)
-                self._send(200, json.dumps({"task_id": tid, "async": True}, ensure_ascii=False))
+                if ai_bridge.context():
+                    job = EXPAND_JOBS[tid]
+                    self._send(200 if job["status"] == "done" else 400, json.dumps(
+                        {"tasks": job["tasks"], "error": job["error"], "llm": {"used": True}}, ensure_ascii=False))
+                else:
+                    self._send(200, json.dumps({"task_id": tid, "async": True}, ensure_ascii=False))
                 return
             llm_info = {"used": False}
             try:
@@ -4786,8 +4915,11 @@ def main():
         srv.daemon_threads = False
         def stop_server():
             lifecycle.stopped.wait()
+            ai_bridge.STOP.set()
             srv.shutdown()
         threading.Thread(target=stop_server, daemon=True).start()
+    _ensure_db()
+    ai_bridge.init(DB_FILE, _execute_ai_job, _finish_ai_job)
     print(f"ComfyUI 批量控制台已启动：http://127.0.0.1:{port}")
     print(f"工作流目录：{DEFAULT_WORKFLOW_DIR}")
     print(f"默认服务器：{DEFAULT_SERVER}")
@@ -4796,6 +4928,7 @@ def main():
     except KeyboardInterrupt:
         print("\n已停止")
     finally:
+        ai_bridge.STOP.set()
         srv.server_close()
         if lifecycle:
             lifecycle.close()

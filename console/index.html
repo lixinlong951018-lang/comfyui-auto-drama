@@ -512,6 +512,7 @@
     </div>
     <div class="cfg-block">
       <div class="cfg-title">🧠 语言模型（剧本/提示词）</div>
+      <label class="field">调用方式<select id="llmInvocation"><option value="api">API 自动调用</option><option value="manual">手动调用 AI</option></select></label>
       <label class="field" style="flex-direction:row;align-items:center;gap:8px">使用
         <select id="llmProvider" style="flex:1">
           <option value="local">本地模型（LM Studio / Ollama）</option>
@@ -545,6 +546,7 @@
     </div>
     <div class="cfg-block">
       <div class="cfg-title">🖼️ 文生图模型（锚点图/场景图/分镜图）</div>
+      <label class="field">调用方式<select id="imgInvocation"><option value="api">API 自动调用</option><option value="manual">手动调用 AI</option></select></label>
       <label class="field" style="flex-direction:row;align-items:center;gap:8px">使用
         <select id="imgProvider" style="flex:1">
           <option value="local">本地（Boogu-Image）</option>
@@ -727,6 +729,22 @@
 
 <div class="toast" id="toast"></div>
 
+
+<style>#aiManualPanel [hidden]{display:none!important}</style>
+<section id="aiManualPanel" hidden style="position:fixed;right:20px;bottom:20px;width:min(640px,94vw);max-height:85vh;overflow:auto;z-index:2000;background:var(--panel,#18212c);border:1px solid var(--line);border-radius:12px;padding:18px;box-shadow:0 4px 24px #0008">
+  <b>等待手动 AI 返回</b>
+  <select id="aiRequestSelect" style="width:100%;margin:10px 0"></select>
+  <label class="field">完整请求内容<textarea id="aiRequestText" readonly style="height:200px"></textarea></label>
+  <button class="btn" id="aiCopy">一键复制</button>
+  <p id="aiReferences" class="hint"></p>
+  <label id="aiTextReturn" class="field">AI 返回内容<textarea id="aiResultText" style="height:130px" placeholder="粘贴 AI 的原始返回内容"></textarea></label>
+  <label id="aiImageReturn" class="field" hidden>上传生成图片<input id="aiResultImage" type="file" accept="image/png,image/jpeg,image/webp"></label>
+  <p id="aiManualError" style="color:var(--red)"></p>
+  <button class="btn primary" id="aiSubmit">提交结果并继续</button>
+  <p class="hint">请求已保存。关闭网页或控制台后，重新打开可继续。</p>
+</section>
+<span id="aiConnection" style="position:fixed;bottom:4px;left:20px;z-index:2001"></span>
+<script src="/ai_manual.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 let images = [];
@@ -881,9 +899,8 @@ async function openProject(name) {
 }
 
 let saveTimer = null;
-function autoSaveProject(silent) {
+async function saveProjectNow(silent=false) {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
     try {
       const payload = {
         name: $('projectName').value.trim() || '未命名项目',
@@ -907,12 +924,18 @@ function autoSaveProject(silent) {
         method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload),
       });
       const d = await r.json();
+      if (!r.ok) throw new Error(d.error || '项目保存失败');
       if (d.project && d.project.name) {
         $('projectChip').textContent = `${d.project.name} · ${d.project.type || ''} · ${d.project.aspect || ''}`;
       }
       if (!silent) toast('💾 项目已自动保存');
-    } catch (e) {}
-  }, 400);
+      return true;
+    } catch (e) { return false; }
+}
+
+function autoSaveProject(silent=false) {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => saveProjectNow(silent), 400);
 }
 
 // ---------- ② 脚本生成 ----------
@@ -1156,7 +1179,10 @@ async function buildPrompts() {
       });
       const d = await r.json();
       if (!r.ok) { toast(d.error, true); return; }
-      pollExpandTask(d.task_id);
+      if (d.tasks) {
+        promptTasks = d.tasks; renderPromptCards(); autoSaveProject(true); toastClear();
+        $('promptHint').textContent = `✅ 已生成 ${promptTasks.length} 段规范提示词`;
+      } else pollExpandTask(d.task_id);
       return; // 轮询接管后续
     } else {
       let tasks = scriptToTasks(currentScript);
@@ -1919,6 +1945,7 @@ async function loadConfigIntoForm() {
     const c = d || {};
     if (c.comfyui && c.comfyui.server) $('serverInput').value = c.comfyui.server;
     const llm = c.llm || {};
+    $('llmInvocation').value = llm.invocation_mode || 'api';
     $('llmProvider').value = llm.provider || 'local';
     if (llm.provider_type) $('llmProviderType').value = llm.provider_type;
     if (llm.local) {
@@ -1931,6 +1958,7 @@ async function loadConfigIntoForm() {
       if (llm.cloud.api_key) $('llmCloudKey').value = llm.cloud.api_key;
     }
     const img = c.image_gen || {};
+    $('imgInvocation').value = img.invocation_mode || 'api';
     $('imgProvider').value = img.provider || 'local';
     if (img.provider_type) $('imgProviderType').value = img.provider_type;
     if (img.local && img.local.url) $('imgLocalUrl').value = img.local.url;
@@ -1954,6 +1982,7 @@ async function saveConfig() {
     cfg.comfyui = cfg.comfyui || {};
     cfg.comfyui.server = $('serverInput').value.trim();
     cfg.llm = {
+      invocation_mode: $('llmInvocation').value,
       provider: $('llmProvider').value,
       provider_type: $('llmProviderType').value,
       local: {url: $('llmLocalUrl').value.trim(), model: $('llmLocalModel').value.trim(), token: (cur.llm && cur.llm.local && cur.llm.local.token) || ''},
@@ -1965,6 +1994,7 @@ async function saveConfig() {
       },
     };
     cfg.image_gen = {
+      invocation_mode: $('imgInvocation').value,
       provider: $('imgProvider').value,
       provider_type: $('imgProviderType').value,
       local: {url: $('imgLocalUrl').value.trim()},
@@ -2349,7 +2379,11 @@ async function genAsset(kind, key, prompt, label, opts) {
   }
   const r = await fetch('/api/asset_gen', {
     method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({prompt, filename: fn, kind, expected}),
+    body: JSON.stringify({prompt, filename: fn, kind, expected, _ai_context: {
+      kind, key: kind === 'story' && /^s\d+$/.test(String(key)) ? String(parseInt(String(key).slice(1),10)-1) : String(key),
+      meta_key: String(key), view: opts.view || (kind === 'role' ? 'front' : ''),
+      role_name: String(key).replace(/_(front|face|side|back)$/, ''),
+    }}),
   });
   const d = await r.json();
   if (!r.ok) throw new Error(d.error || '生图失败');
@@ -2422,14 +2456,26 @@ function defaultStoryPrompt(i) {
     + `；背景元素必须与上面「场景」描述一致（门窗/设备/位置不得凭空增加或替换）`;
 }
 
+function rememberAssetWorkflow(kind, idx, key) {
+  const slot = 'aiAssetWorkflow:' + currentProjectName;
+  if (!localStorage.getItem(slot)) localStorage.setItem(slot, JSON.stringify({
+    type:'image',kind,idx,key:String(key),before:(assetImgs[kind] || {})[key] || ''}));
+}
+function finishAssetWorkflow() {
+  const slot = 'aiAssetWorkflow:' + currentProjectName;
+  const raw = localStorage.getItem(slot);
+  if (raw && JSON.parse(raw).type === 'image') localStorage.removeItem(slot);
+}
+
 async function genRoleImg(i) {
   const r = (currentScript.role_list || [])[i];
   if (!r) return;
   const name = r.role_name || r.name;
+  rememberAssetWorkflow('role', i, name);
   const ta = document.querySelector(`.asset-prompt[data-kind="role"][data-key="${CSS.escape(name)}"]`);
   const prompt = (ta && ta.value.trim()) || defaultRolePrompt(r, assetImgs.roleGender && assetImgs.roleGender[name]);
   assetPrompts.role[name] = prompt;
-  const btn = event.target; btn.disabled = true; btn.textContent = '生成中…';
+  const btn = (typeof event !== "undefined" && event && event.target) || {disabled:false,textContent:""}; btn.disabled = true; btn.textContent = '生成中…';
   toastLoading(`🖼️ 正在生成「${name}」锚点图（约 10-30 秒）…`);
   try {
     assetImgs.role[name] = await genAsset('role', name, prompt, '锚点');
@@ -2442,6 +2488,7 @@ async function genRoleImg(i) {
     assetState.roles[name].views.front = assetImgs.role[name];
     renderAssets();
     autoSaveProject(true);
+    finishAssetWorkflow();
     toast(`✅ 「${name}」锚点图已生成，可设为参考图`);
   } catch (e) { toast(e.message, true); }
   finally { btn.disabled = false; btn.textContent = '🖼️ 生成锚点图'; }
@@ -2496,27 +2543,32 @@ async function genRoleView(i, view) {
 }
 
 async function genRoleFourViews(i) {
+  window.aiAssetWorkflowActive = true;
+  localStorage.setItem("aiAssetWorkflow:" + currentProjectName, JSON.stringify({type:"views",i}));
   const r = (currentScript.role_list || [])[i];
-  if (!r) return;
+  if (!r) { window.aiAssetWorkflowActive = false; return; }
   const name = r.role_name || r.name;
   assetImgs.roleViews = assetImgs.roleViews || {};
   assetImgs.roleViews[name] = assetImgs.roleViews[name] || {};
   const missing = ['front', 'face', 'side', 'back'].filter(v => !assetImgs.roleViews[name][v]);
-  if (!missing.length) { toast(`✅ 「${name}」四视图已齐全`); return; }
+  if (!missing.length) { window.aiAssetWorkflowActive = false; localStorage.removeItem('aiAssetWorkflow:' + currentProjectName); toast(`✅ 「${name}」四视图已齐全`); return; }
   toastLoading(`🧩 正在补齐「${name}」四视图（${missing.length} 张，每张约 10-30 秒）…`);
   for (const v of missing) {
     await genRoleView(i, v);
   }
+  localStorage.removeItem("aiAssetWorkflow:" + currentProjectName);
+  window.aiAssetWorkflowActive = false;
   toast(`✅ 「${name}」四视图生成完成`);
 }
 
 async function genSceneImg(i) {
   const sc = sceneNames[i];
   if (!sc) return;
+  rememberAssetWorkflow('scene', i, sc);
   const ta = document.querySelector(`.asset-prompt[data-kind="scene"][data-key="${CSS.escape(sc)}"]`);
   const prompt = (ta && ta.value.trim()) || defaultScenePrompt(sc);
   assetPrompts.scene[sc] = prompt;
-  const btn = event.target; btn.disabled = true; btn.textContent = '生成中…';
+  const btn = (typeof event !== "undefined" && event && event.target) || {disabled:false,textContent:""}; btn.disabled = true; btn.textContent = '生成中…';
   toastLoading(`🖼️ 正在生成场景图「${sc}」（约 10-30 秒）…`);
   try {
     assetImgs.scene[sc] = await genAsset('scene', sc, prompt, '场景');
@@ -2524,12 +2576,14 @@ async function genSceneImg(i) {
     assetState.scenes[sc].reference = assetImgs.scene[sc];
     renderAssets();
     autoSaveProject(true);
+    finishAssetWorkflow();
     toast(`✅ 场景图「${sc}」已生成`);
   } catch (e) { toast(e.message, true); }
   finally { btn.disabled = false; btn.textContent = '🖼️ 生成'; }
 }
 
 async function genStoryImg(i) {
+  rememberAssetWorkflow('story', i, i);
   const ta = document.querySelector(`.asset-prompt[data-kind="story"][data-key="${i}"]`);
   let prompt = (ta && ta.value.trim()) || defaultStoryPrompt(i);
   // AI 按剧情生成规范提示词（用户手动编辑过的不覆盖）
@@ -2544,7 +2598,7 @@ async function genStoryImg(i) {
       }));
       const r = await fetch('/api/story_prompt', {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({storyboard: sb, roles, lmstudio_token: $('lmToken').value.trim()}),
+        body: JSON.stringify({storyboard: sb, roles, _ai_context:{kind:'story',key:String(i),next:'image',idx:i}, lmstudio_token: $('lmToken').value.trim()}),
       });
       const d = await r.json();
       if (r.ok && d.prompt) {
@@ -2554,12 +2608,13 @@ async function genStoryImg(i) {
     } catch (e) { /* AI 失败回退规则模板 */ }
   }
   assetPrompts.story[i] = prompt;
-  const btn = event.target; btn.disabled = true; btn.textContent = '生成中…';
+  const btn = (typeof event !== "undefined" && event && event.target) || {disabled:false,textContent:""}; btn.disabled = true; btn.textContent = '生成中…';
   toastLoading(`🎬 正在生成分镜 ${i + 1} 图（约 10-30 秒）…`);
   try {
     assetImgs.story[i] = await genAsset('story', `s${i + 1}`, prompt, '分镜');
     renderAssets();
     autoSaveProject(true);
+    finishAssetWorkflow();
     toast(`✅ 分镜 ${i + 1} 图已生成`);
   } catch (e) { toast(e.message, true); }
   finally { btn.disabled = false; btn.textContent = '🎬 生成分镜图'; }
@@ -2627,11 +2682,12 @@ async function doPromptModify() {
   if (!instruction) { toast('请输入修改要求', true); return; }
   const {kind, key} = promptModalCtx || {};
   if (kind == null) return;
+  rememberAssetWorkflow(kind, promptModalCtx.idx, key);
   toastLoading('🤖 AI 正在修改提示词…');
   try {
     const r = await fetch('/api/asset_prompt', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({current_prompt: assetPromptOf(kind, key), instruction, lmstudio_token: $('lmToken').value.trim()}),
+      body: JSON.stringify({current_prompt: assetPromptOf(kind, key), instruction, _ai_context:{kind,key:String(key),next:'image',idx:promptModalCtx.idx}, lmstudio_token: $('lmToken').value.trim()}),
     });
     const d = await r.json();
     if (!r.ok) { toast(d.error, true); return; }
@@ -2646,7 +2702,9 @@ async function doPromptModify() {
 }
 
 async function genAllAssets() {
-  if (!currentScript) { toast('请先生成剧本', true); return; }
+  window.aiAssetWorkflowActive = true;
+  localStorage.setItem("aiAssetWorkflow:" + currentProjectName, JSON.stringify({type:"all"}));
+  if (!currentScript) { window.aiAssetWorkflowActive = false; toast('请先生成剧本', true); return; }
   const roles = (currentScript.role_list || []);
   const sb = (currentScript.storyboard_list || []);
   const fourViews = $('genFourViews') ? $('genFourViews').checked : true;
@@ -2688,7 +2746,7 @@ async function genAllAssets() {
     }
   });
   const total = todo.length;
-  if (!total) { toast('没有可生成的资产', true); return; }
+  if (!total) { window.aiAssetWorkflowActive = false; localStorage.removeItem("aiAssetWorkflow:" + currentProjectName); toast('没有可生成的资产', true); return; }
   toastLoading(`⚡ 一键生成中（共 ${total} 张，每张约 10-30 秒）…`);
   $('assetProgress').style.display = '';
   $('assetBar').style.width = '0%';
@@ -2706,8 +2764,10 @@ async function genAllAssets() {
     renderAssets();
     autoSaveProject(true);
     $('assetProgress').style.display = 'none';
+    localStorage.removeItem("aiAssetWorkflow:" + currentProjectName);
     toast(`✅ 一键生成完成，共 ${total} 张`);
   } catch (e) { $('assetProgress').style.display = 'none'; toast('一键生成中断：' + e.message, true); renderAssets(); }
+  finally { window.aiAssetWorkflowActive = false; }
 }
 
 async function genRoleViewAsset(i, view) {

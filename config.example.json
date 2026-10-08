@@ -11,6 +11,7 @@
     ]
   },
   "llm": {
+    "invocation_mode": "api",
     "provider": "local",
     "provider_type": "openai",
     "local": {
@@ -26,6 +27,7 @@
     }
   },
   "image_gen": {
+    "invocation_mode": "api",
     "provider": "local",
     "provider_type": "openai",
     "local": {
