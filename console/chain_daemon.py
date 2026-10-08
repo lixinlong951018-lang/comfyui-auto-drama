@@ -12,21 +12,27 @@
 import os
 import sys
 import time
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import batch_console as bc
 
 
 def main():
+    lifecycle = None
+    if os.name == "nt":
+        from windows_lifecycle import Service
+        lifecycle = Service("chain_daemon")
+    stopped = lifecycle.stopped if lifecycle else threading.Event()
     server = bc.DEFAULT_SERVER
     print(f"[daemon] 启动，服务器 {server}，每 20 秒检查一次", flush=True)
-    while True:
+    while not stopped.is_set():
         try:
             state = bc.load_state()
             tasks = [t for t in state.get("tasks", []) if t.get("prompt_id") or t.get("chain_waiting")]
             if not tasks:
                 print(f"[daemon] {time.strftime('%H:%M:%S')} 无活动任务，持续待命", flush=True)
-                time.sleep(20)
+                stopped.wait(20)
                 continue
             result = bc.get_status(server)
             if not result.get("server_ok"):
@@ -45,7 +51,7 @@ def main():
                 )
         except Exception as e:
             print(f"[daemon] 错误：{e}", flush=True)
-        time.sleep(20)
+        stopped.wait(20)
 
 
 if __name__ == "__main__":

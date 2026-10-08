@@ -1071,7 +1071,7 @@ def extract_last_frame(video_path):
     out_png = os.path.join(tmpdir, "last.png")
     shutil.copy(video_path, tmp_video)
     r = subprocess.run(
-        ["ffmpeg", "-y", "-sseof", "-0.1", "-i", tmp_video, "-frames:v", "1", out_png],
+        ["ffmpeg", "-y", "-sseof", "-1", "-i", tmp_video, "-vf", "reverse", "-frames:v", "1", out_png],
         capture_output=True,
     )
     if r.returncode != 0 or not os.path.exists(out_png):
@@ -4777,7 +4777,17 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8890
+    lifecycle = None
+    if os.name == "nt":
+        from windows_lifecycle import Service
+        lifecycle = Service("batch_console")
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    if lifecycle:
+        srv.daemon_threads = False
+        def stop_server():
+            lifecycle.stopped.wait()
+            srv.shutdown()
+        threading.Thread(target=stop_server, daemon=True).start()
     print(f"ComfyUI 批量控制台已启动：http://127.0.0.1:{port}")
     print(f"工作流目录：{DEFAULT_WORKFLOW_DIR}")
     print(f"默认服务器：{DEFAULT_SERVER}")
@@ -4785,6 +4795,10 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止")
+    finally:
+        srv.server_close()
+        if lifecycle:
+            lifecycle.close()
 
 
 if __name__ == "__main__":
